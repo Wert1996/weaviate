@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"sync"
 
 	"github.com/weaviate/weaviate/entities/dto"
 
@@ -251,6 +252,7 @@ func (ri *RemoteIndex) SearchShard(ctx context.Context, shard string,
 	cursor *filters.Cursor,
 	groupBy *searchparams.GroupBy,
 	adds additional.Properties,
+	replProps *additional.ReplicationProperties,
 	replEnabled bool,
 	targetCombination *dto.TargetCombination,
 ) ([]*storobj.Object, []float32, string, error) {
@@ -266,7 +268,7 @@ func (ri *RemoteIndex) SearchShard(ctx context.Context, shard string,
 		}
 		return pair{objs, scores}, err
 	}
-	rr, node, err := ri.queryReplicas(ctx, shard, f)
+	rr, node, err := ri.queryReplicas(ctx, shard, replProps, f)
 	if err != nil {
 		return nil, nil, node, err
 	}
@@ -372,6 +374,8 @@ func (ri *RemoteIndex) UpdateShardStatus(ctx context.Context, shardName, targetS
 func (ri *RemoteIndex) queryReplicas(
 	ctx context.Context,
 	shard string,
+	replProps *additional.ReplicationProperties,
+	searchForceExpand bool,
 	do func(nodeName, host string) (interface{}, error),
 ) (resp interface{}, node string, err error) {
 	replicas, err := ri.stateGetter.ShardReplicas(ri.class, shard)
@@ -380,7 +384,6 @@ func (ri *RemoteIndex) queryReplicas(
 			"",
 			fmt.Errorf("class %q has no physical shard %q: %w", ri.class, shard, err)
 	}
-
 	queryOne := func(replica string) (interface{}, error) {
 		host, ok := ri.nodeResolver.NodeHostname(replica)
 		if !ok || host == "" {
@@ -389,12 +392,23 @@ func (ri *RemoteIndex) queryReplicas(
 		return do(replica, host)
 	}
 
+	if searchForceExpand {
+		return ri.queryAllReplicas(ctx, replicas, replProps, queryOne)
+	}
+	return ri.queryOneReplica(ctx, replicas, queryOne)
+}
+
+func (ri *RemoteIndex) queryOneReplica(
+	ctx context.Context, 
+	replicas []string,
+	queryFunc func(replica string) (interface{}, error),
+) (resp interface{}, node string, err error) {
 	queryUntil := func(replicas []string) (resp interface{}, node string, err error) {
 		for _, node = range replicas {
 			if errC := ctx.Err(); errC != nil {
 				return nil, node, errC
 			}
-			if resp, err = queryOne(node); err == nil {
+			if resp, err = queryFunc(node); err == nil {
 				return resp, node, nil
 			}
 		}
@@ -405,4 +419,47 @@ func (ri *RemoteIndex) queryReplicas(
 		return queryUntil(replicas[:first])
 	}
 	return
+}
+
+func (ri *RemoteIndex) queryAllReplicas(
+	ctx context.Context, 
+	replicas []string,
+	replProps *additional.ReplicationProperties,
+	queryFunc func(replica string) (interface{}, error),
+) (resp interface{}, node string, err error) {
+	var (
+		mu       sync.Mutex
+		wg       sync.WaitGroup
+		responses []interface{}
+		errors    []error
+	)
+
+	for _, replica := range replicas {
+		wg.Add(1)
+		go func(replica string) {
+			defer wg.Done()
+			resp, err := queryFunc(replica)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				errors = append(errors, err)
+			} else {
+				responses = append(responses, resp)
+			}
+		}(replica)
+	}
+
+	wg.Wait()
+
+	if replProps != nil && replProps.ConsistencyLevel ==  "QUORUM" {
+		if len(errors) > len(replicas)/2 {
+			return nil, "", fmt.Errorf("quorum consistency level not met, majority of responses are errors")
+		}
+	} else if replProps != nil && replProps.ConsistencyLevel == "ALL" {
+		if len(errors) > 0 {
+			return nil, "", fmt.Errorf("all consistency level not met, all responses are errors")
+		}
+	}
+
+	return responses, "", nil
 }

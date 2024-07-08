@@ -1254,7 +1254,7 @@ func (i *Index) objectSearch(ctx context.Context, limit int, filters *filters.Lo
 	}
 
 	outObjects, outScores, err := i.objectSearchByShard(ctx, limit,
-		filters, keywordRanking, sort, cursor, addlProps, shardNames)
+		filters, keywordRanking, sort, cursor, addlProps, replProps, shardNames)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1341,7 +1341,7 @@ func (i *Index) objectSearch(ctx context.Context, limit int, filters *filters.Lo
 
 func (i *Index) objectSearchByShard(ctx context.Context, limit int, filters *filters.LocalFilter,
 	keywordRanking *searchparams.KeywordRanking, sort []filters.Sort, cursor *filters.Cursor,
-	addlProps additional.Properties, shards []string,
+	addlProps additional.Properties, replProps *additional.ReplicationProperties, shards []string,
 ) ([]*storobj.Object, []float32, error) {
 	resultObjects, resultScores := objectSearchPreallocate(limit, shards)
 
@@ -1366,7 +1366,7 @@ func (i *Index) objectSearchByShard(ctx context.Context, limit int, filters *fil
 
 			if shard != nil {
 				defer release()
-				objs, scores, err = shard.ObjectSearch(ctx, limit, filters, keywordRanking, sort, cursor, addlProps)
+				objs, scores, err = shard.ObjectSearch(ctx, limit, filters, keywordRanking, sort, cursor, addlProps, replProps)
 				if err != nil {
 					return fmt.Errorf(
 						"local shard object search %s: %w", shard.ID(), err)
