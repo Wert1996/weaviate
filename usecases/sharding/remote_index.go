@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"sync"
 
 	"github.com/weaviate/weaviate/entities/dto"
 
@@ -374,13 +375,14 @@ func (ri *RemoteIndex) queryReplicas(
 	shard string,
 	do func(nodeName, host string) (interface{}, error),
 ) (resp interface{}, node string, err error) {
+	searchForceExpand := true
+	replicationLevel := "ALL"
 	replicas, err := ri.stateGetter.ShardReplicas(ri.class, shard)
 	if err != nil || len(replicas) == 0 {
 		return nil,
 			"",
 			fmt.Errorf("class %q has no physical shard %q: %w", ri.class, shard, err)
 	}
-
 	queryOne := func(replica string) (interface{}, error) {
 		host, ok := ri.nodeResolver.NodeHostname(replica)
 		if !ok || host == "" {
@@ -389,12 +391,23 @@ func (ri *RemoteIndex) queryReplicas(
 		return do(replica, host)
 	}
 
+	if searchForceExpand {
+		return ri.queryAllReplicas(replicas, replicationLevel, queryOne)
+	}
+	return ri.queryOneReplica(ctx, replicas, queryOne)
+}
+
+func (ri *RemoteIndex) queryOneReplica(
+	ctx context.Context, 
+	replicas []string,
+	queryFunc func(replica string) (interface{}, error),
+) (resp interface{}, node string, err error) {
 	queryUntil := func(replicas []string) (resp interface{}, node string, err error) {
 		for _, node = range replicas {
 			if errC := ctx.Err(); errC != nil {
 				return nil, node, errC
 			}
-			if resp, err = queryOne(node); err == nil {
+			if resp, err = queryFunc(node); err == nil {
 				return resp, node, nil
 			}
 		}
@@ -405,4 +418,46 @@ func (ri *RemoteIndex) queryReplicas(
 		return queryUntil(replicas[:first])
 	}
 	return
+}
+
+func (ri *RemoteIndex) queryAllReplicas(
+	replicas []string,
+	consistencyLevel string,
+	queryFunc func(replica string) (interface{}, error),
+) (resp interface{}, node string, err error) {
+	var (
+		mu       sync.Mutex
+		wg       sync.WaitGroup
+		responses []interface{}
+		errors    []error
+	)
+
+	for _, replica := range replicas {
+		wg.Add(1)
+		go func(replica string) {
+			defer wg.Done()
+			resp, err := queryFunc(replica)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				errors = append(errors, err)
+			} else {
+				responses = append(responses, resp)
+			}
+		}(replica)
+	}
+
+	wg.Wait()
+
+	if consistencyLevel ==  "QUORUM" {
+		if len(errors) > len(replicas)/2 {
+			return nil, "", fmt.Errorf("'QUORUM' consistency level not met, majority of responses are errors")
+		}
+	} else if consistencyLevel == "ALL" {
+		if len(errors) > 0 {
+			return nil, "", fmt.Errorf("'ALL' consistency level not met, more than 1 responses from replicas are errors")
+		}
+	}
+
+	return responses, "", nil
 }
